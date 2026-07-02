@@ -5,7 +5,7 @@ extends RefCounted
 var _tween: Tween
 var _targets: Array = []
 var _duration: float = 1.0
-var _transition_type: Tween.TransitionType = Tween.TRANS_LINEAR
+var _transition_type: Tween.TransitionType = Tween.TRANS_QUAD
 var _ease_type: Tween.EaseType = Tween.EASE_IN_OUT
 var _parallel: bool = false
 var _custom_interpolator: Callable = Callable()
@@ -13,7 +13,8 @@ var _custom_interpolator: Callable = Callable()
 signal completed
 
 const _easing_map := {
-	"linear": [Tween.TRANS_LINEAR, Tween.EASE_IN_OUT],
+	"spring": ["custom_spring", [1.0, 100.0, 10.0, 0.0]], # anime.js physics fallback defaults
+	
 	"inquad": [Tween.TRANS_QUAD, Tween.EASE_IN],
 	"outquad": [Tween.TRANS_QUAD, Tween.EASE_OUT],
 	"inoutquad": [Tween.TRANS_QUAD, Tween.EASE_IN_OUT],
@@ -74,18 +75,34 @@ func easing(easing_string: String) -> extween:
 	if clean.contains("("):
 		var parts = clean.split("(")
 		var ease_name = parts[0]
-		var args_str = parts[1].replace(")", "")
-		var args = Array(args_str.split(",")).map(func(x): return float(x))
+		var inner_str = parts[1].trim_suffix(")")
 		
-		_build_parameterized_ease(ease_name, args)
+		# Detect if configuration is dictionary-based e.g., spring({bounce:0.15,duration:300})
+		if inner_str.begins_with("{") and inner_str.ends_with("}"):
+			var dict_content = inner_str.trim_prefix("{").trim_suffix("}")
+			var pairs = dict_content.split(",")
+			var dict_args = {}
+			for pair in pairs:
+				var kv = pair.split(":")
+				if kv.size() == 2:
+					dict_args[kv[0].strip_edges()] = float(kv[1].strip_edges())
+			
+			_build_parameterized_ease_dict(ease_name, dict_args)
+		else:
+			# Handle standard array string formatting e.g., spring(1, 100, 10, 0)
+			var args = Array(inner_str.split(",")).map(func(x): return float(x) if x.is_valid_float() else 0.0)
+			_build_parameterized_ease(ease_name, args)
 	else:
 		if _easing_map.has(clean):
-			_transition_type = _easing_map[clean][0]
-			_ease_type = _easing_map[clean][1]
+			var map_val = _easing_map[clean]
+			if map_val[0] is String and map_val[0] == "custom_spring":
+				_build_parameterized_ease("spring", map_val[1])
+			else:
+				_transition_type = map_val[0]
+				_ease_type = map_val[1]
 		else:
-			push_warning("extween: easing '" + easing_string + "' not found. defaulting to linear.")
-			_transition_type = Tween.TRANS_LINEAR
-			_ease_type = Tween.EASE_IN_OUT
+			push_warning("extween: easing '" + easing_string + "' not found. defaulting to spring.")
+			_build_parameterized_ease("spring", [])
 	return self
 
 func steps(number_of_steps: int) -> extween:
@@ -115,10 +132,8 @@ func add(props: Dictionary, delay_stagger: float = 0.0) -> extween:
 				push_error("extween: property '" + str(prop) + "' not found on target " + str(target))
 				continue
 			
-			# if a callable function is passed as a property parameter, evaluate it upfront
 			var final_value = raw_value
 			if raw_value is Callable:
-				# passes (target_index, total_targets, target_node) matching anime.js value parameter function parameters
 				final_value = raw_value.call(i, _targets.size(), target)
 				
 			var tweener = _tween.tween_property(target, sanitized_path, final_value, _duration)
@@ -146,8 +161,60 @@ func pause() -> void: _tween.pause()
 func play() -> void: _tween.play()
 func kill() -> void: _tween.kill()
 
+func _build_parameterized_ease_dict(name: String, dict_args: Dictionary) -> void:
+	if name == "spring":
+		# anime.js perceived spring default settings: bounce = 0.5, duration = 628
+		var bounce = dict_args.get("bounce", 0.5)
+		var duration_ms = dict_args.get("duration", 628.0)
+		
+		# Overwrite tween instance duration with perceived spring calculation (matching anime.js override logic)
+		_duration = duration_ms / 1000.0 
+		
+		# Map visual "bounce" and "duration" to raw mass/stiffness/damping via standard SwiftUI conversions
+		var mass = 1.0
+		var zeta = 0.0
+		if bounce > 0.0:
+			zeta = 1.0 - bounce
+		elif bounce < 0.0:
+			zeta = 1.0 / (1.0 + bounce)
+		else:
+			zeta = 1.0
+			
+		var duration_scaled = _duration
+		var omega = (2.0 * PI) / (duration_scaled * sqrt(max(0.001, 1.0 - zeta * zeta)))
+		if zeta >= 1.0:
+			omega = (2.0 * PI) / duration_scaled
+			
+		var stiffness = mass * (omega * omega)
+		var damping = 2.0 * zeta * sqrt(stiffness * mass)
+		
+		_build_parameterized_ease("spring", [mass, stiffness, damping, 0.0])
+
 func _build_parameterized_ease(name: String, args: Array) -> void:
 	match name:
+		"spring":
+			var mass = args[0] if args.size() > 0 else 1.0
+			var stiffness = args[1] if args.size() > 1 else 100.0
+			var damping = args[2] if args.size() > 2 else 10.0
+			var velocity = args[3] if args.size() > 3 else 0.0
+			
+			var omega = sqrt(stiffness / mass)
+			var zeta = damping / (2.0 * sqrt(stiffness * mass))
+			
+			_custom_interpolator = func(t: float) -> float:
+				if t <= 0.0: return 0.0
+				if t >= 1.0: return 1.0
+				
+				# Convert uniform 0-1 time scale to natural system settling progression
+				var t_scaled = t * 12.0 
+				
+				if zeta < 1.0:
+					var omega_d = omega * sqrt(1.0 - zeta * zeta)
+					var envelope = exp(-zeta * omega * t_scaled)
+					return 1.0 - envelope * (cos(omega_d * t_scaled) + ((zeta * omega - velocity) / omega_d) * sin(omega_d * t_scaled))
+				else:
+					var envelope = exp(-omega * t_scaled)
+					return 1.0 - envelope * (1.0 + (omega - velocity) * t_scaled)
 		"cubicbezier":
 			var x1 = args[0] if args.size() > 0 else 0.0
 			var y1 = args[1] if args.size() > 1 else 0.0
@@ -206,6 +273,5 @@ func _build_parameterized_ease(name: String, args: Array) -> void:
 				if t < 1.0: t -= 1.0; return -0.5 * (a * pow(2.0, 10.0 * t) * sin((t - s) * (2.0 * PI) / p))
 				t -= 1.0; return a * pow(2.0, -10.0 * t) * sin((t - s) * (2.0 * PI) / p) * 0.5 + 1.0
 		_:
-			push_warning("extween: parameterized easing '" + name + "' not supported. falling back to linear.")
-			_transition_type = Tween.TRANS_LINEAR
-			_ease_type = Tween.EASE_IN_OUT
+			push_warning("extween: parameterized easing '" + name + "' not supported. falling back to spring.")
+			_build_parameterized_ease("spring", [])
