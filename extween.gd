@@ -1,326 +1,190 @@
-class_name extween
-extends Node
-
-# ----------------------------
-# EASING ENUM (FIXED)
-# ----------------------------
-enum Ease {
-	LINEAR,
-
-	IN_SINE,
-	OUT_SINE,
-	IN_OUT_SINE,
-
-	IN_QUAD,
-	OUT_QUAD,
-	IN_OUT_QUAD,
-
-	IN_CUBIC,
-	OUT_CUBIC,
-	IN_OUT_CUBIC,
-
-	IN_QUART,
-	OUT_QUART,
-	IN_OUT_QUART,
-
-	IN_QUINT,
-	OUT_QUINT,
-	IN_OUT_QUINT,
-
-	IN_EXPO,
-	OUT_EXPO,
-	IN_OUT_EXPO,
-
-	IN_CIRC,
-	OUT_CIRC,
-	IN_OUT_CIRC,
-
-	IN_BACK,
-	OUT_BACK,
-	IN_OUT_BACK,
-
-	IN_BOUNCE,
-	OUT_BOUNCE,
-	IN_OUT_BOUNCE,
-
-	STEPS,
-
-	IN_ELASTIC,
-	OUT_ELASTIC,
-	IN_OUT_ELASTIC,
-
-	CUBIC_BEZIER,
-	SPRING
-}
-
-# ----------------------------
-# STRING -> ENUM MAP
-# ----------------------------
-const EASING_FUNCTIONS = {
-	"linear": Ease.LINEAR,
-
-	"sine": Ease.IN_SINE,
-	"insine": Ease.IN_SINE,
-	"outsine": Ease.OUT_SINE,
-	"inoutsine": Ease.IN_OUT_SINE,
-
-	"quad": Ease.IN_QUAD,
-	"inquad": Ease.IN_QUAD,
-	"outquad": Ease.OUT_QUAD,
-	"inoutquad": Ease.IN_OUT_QUAD,
-
-	"cubic": Ease.IN_CUBIC,
-	"quart": Ease.IN_QUART,
-	"quint": Ease.IN_QUINT,
-
-	"expo": Ease.IN_EXPO,
-	"circ": Ease.IN_CIRC,
-
-	"back": Ease.IN_BACK,
-	"outback": Ease.OUT_BACK,
-	"inoutback": Ease.IN_OUT_BACK,
-
-	"bounce": Ease.OUT_BOUNCE,
-	"steps": Ease.STEPS,
-
-	"elastic": Ease.OUT_ELASTIC,
-	"cubicbezier": Ease.CUBIC_BEZIER,
-	"spring": Ease.SPRING
-}
-
-# ----------------------------
-# TRACK DATA
-# ----------------------------
-class CompiledTrack:
-	var getter: Callable
-	var setter: Callable
-
-	var from_value: float = 0.0
-	var to_value: float = 0.0
-
-	var duration: float = 0.0
-	var delay: float = 0.0
-
-	var easing_type: int = 0
-
-	var easing_a: float = 0.0
-	var easing_b: float = 0.0
-	var easing_c: float = 0.0
-	var easing_d: float = 0.0
-
-	var is_relative: bool = false
-	var relative_multiplier: float = 1.0
-	var relative_add: float = 0.0
+class_name Extween
+extends RefCounted
 
 
-# ----------------------------
-# TIMELINE
-# ----------------------------
-class CompiledTimeline:
-	var bytecode: Array[CompiledTrack] = []
-	var elapsed_time: float = 0.0
-	var is_playing: bool = false
-	var total_duration: float = 0.0
+enum PlayState { PAUSED, PLAYING, COMPLETED }
+
+
+var _tween: Tween
+var _state: PlayState = PlayState.PAUSED
+var _context: Node
+
+
+func _init(context: Node = null):
+	if context:
+		_context = context
+		_tween = context.get_tree().create_tween()
+
+
+func run_step(step: Dictionary) -> void:
+	var targets = step.get("targets", [])
+	if not (targets is Array):
+		targets = [targets]
+
+	var duration := step.get("duration", 1000.0) / 1000.0
+	var ease := step.get("ease", "linear")
+	var delay := step.get("delay", 0.0)
+	var stagger := step.get("stagger", 0.0)
+	var props := step.get("props", {})
+
+	var index := 0
+
+	for target in targets:
+		if not is_instance_valid(target):
+			continue
+
+		var target_delay = delay + (index * stagger)
+
+		for prop in props.keys():
+			var end_val = props[prop]
+			var start_val = target.get(prop)
+
+			if _is_simple(end_val):
+				var tw = _tween.tween_property(target, prop, end_val, duration)
+				_apply_ease(tw, ease)
+				tw.set_delay(target_delay)
+			else:
+				var fn = func(t):
+					return evaluate_easing(ease, t)
+
+				var tw2 = _tween.tween_method(func(t):
+					var f = fn.call(t)
+
+					if start_val is Vector2 or start_val is Vector3 or start_val is Color:
+						target.set(prop, start_val.lerp(end_val, f))
+					else:
+						target.set(prop, start_val + (end_val - start_val) * f)
+				, 0.0, 1.0, duration)
+
+				tw2.set_delay(target_delay)
+
+		index += 1
+
+
+static func _is_simple(value) -> bool:
+	return typeof(value) in [
+		TYPE_FLOAT,
+		TYPE_INT,
+		TYPE_VECTOR2,
+		TYPE_VECTOR3,
+		TYPE_COLOR
+	]
+
+
+static func _apply_ease(tw: Tween, ease: String) -> void:
+	match ease.to_lower():
+		"linear": tw.set_trans(Tween.TRANS_LINEAR)
+		"sine": tw.set_trans(Tween.TRANS_SINE)
+		"quad": tw.set_trans(Tween.TRANS_QUAD)
+		"cubic": tw.set_trans(Tween.TRANS_CUBIC)
+		"quart": tw.set_trans(Tween.TRANS_QUART)
+		"quint": tw.set_trans(Tween.TRANS_QUINT)
+		"expo": tw.set_trans(Tween.TRANS_EXPO)
+		"circ": tw.set_trans(Tween.TRANS_CIRC)
+		"back": tw.set_trans(Tween.TRANS_BACK)
+		"bounce": tw.set_trans(Tween.TRANS_BOUNCE)
+		"elastic": tw.set_trans(Tween.TRANS_ELASTIC)
+
+
+static func evaluate_easing(easing_name: String, t: float) -> float:
+	t = clamp(t, 0.0, 1.0)
+	var e = easing_name.strip_edges().to_lower()
+
+	if e.begins_with("in("):
+		var p = e.split("(")[1].replace(")", "").to_float()
+		return pow(t, p)
+
+	if e.begins_with("out("):
+		var p = e.split("(")[1].replace(")", "").to_float()
+		return 1.0 - pow(1.0 - t, p)
+
+	match e:
+		"linear": return t
+		"insine": return 1.0 - cos(t * PI * 0.5)
+		"outsine": return sin(t * PI * 0.5)
+		"inoutcirc": return 0.5 * (1.0 - cos(PI * t))
+		"outcirc": return sqrt(1.0 - (t - 1.0) * (t - 1.0))
+		_: return t
+
+
+# timeline
+class Timeline:
+	extends RefCounted
+
+	var _steps: Array = []
+	var _engine: Extween
+	var _context: Node
+	var _index := 0
+	var _started := false
+
+
+	func _init(context: Node):
+		_context = context
+		_engine = Extween.new(context)
+
+
+	func to(targets, config: Dictionary) -> Timeline:
+		_steps.append({
+			"type": "to",
+			"targets": targets,
+			"props": _extract_props(config),
+			"duration": config.get("duration", 1000),
+			"ease": config.get("ease", "linear"),
+			"delay": config.get("delay", 0.0),
+			"stagger": config.get("stagger", 0.0)
+		})
+		return self
+
+
+	func wait(ms: float) -> Timeline:
+		_steps.append({
+			"type": "wait",
+			"duration": ms
+		})
+		return self
+
+
+	func from(targets, config: Dictionary) -> Timeline:
+		for t in targets:
+			if not is_instance_valid(t):
+				continue
+			for k in config.keys():
+				t.set(k, config[k])
+		return self
+
 
 	func play() -> void:
-		for track in bytecode:
-			if track.is_relative:
-				var current_base = float(track.getter.call())
-				track.from_value = current_base
-				track.to_value = (current_base * track.relative_multiplier) + track.relative_add
+		if _started:
+			return
 
-		is_playing = true
-		extween._register_compiled_run(self)
-
-	func step_process(delta: float) -> bool:
-		if not is_playing:
-			return true
-
-		elapsed_time += delta
-		var active := false
-
-		for track in bytecode:
-			if elapsed_time < track.delay:
-				active = true
-				continue
-
-			var t := (elapsed_time - track.delay) / max(track.duration, 0.00001)
-			t = clamp(t, 0.0, 1.0)
-
-			var weight := 1.0
-
-			match track.easing_type:
-
-				Ease.LINEAR:
-					weight = t
-
-				Ease.IN_SINE:
-					weight = 1.0 - cos((t * PI) * 0.5)
-				Ease.OUT_SINE:
-					weight = sin((t * PI) * 0.5)
-				Ease.IN_OUT_SINE:
-					weight = -(cos(PI * t) - 1.0) * 0.5
-
-				Ease.IN_QUAD:
-					weight = t * t
-				Ease.OUT_QUAD:
-					weight = 1.0 - (1.0 - t) * (1.0 - t)
-				Ease.IN_OUT_QUAD:
-					weight = (2.0 * t * t) if t < 0.5 else 1.0 - pow(-2.0 * t + 2.0, 2.0) * 0.5
-
-				Ease.IN_CUBIC:
-					weight = t * t * t
-				Ease.OUT_CUBIC:
-					weight = 1.0 - pow(1.0 - t, 3.0)
-				Ease.IN_OUT_CUBIC:
-					weight = (4.0 * t * t * t) if t < 0.5 else 1.0 - pow(-2.0 * t + 2.0, 3.0) * 0.5
-
-				Ease.OUT_BOUNCE:
-					weight = _bounce_out(t)
-
-				Ease.IN_BOUNCE:
-					weight = 1.0 - _bounce_out(1.0 - t)
-
-				Ease.IN_OUT_BOUNCE:
-					weight = (_bounce_out(t * 2.0) * 0.5) if t < 0.5 else (1.0 + _bounce_out(t * 2.0 - 1.0)) * 0.5
-
-				_:
-					weight = t
-
-			var value = lerp(track.from_value, track.to_value, weight)
-			track.setter.call(value)
-
-			if t < 1.0:
-				active = true
-
-		return not active
+		_started = true
+		_run_next()
 
 
-	func _bounce_out(t: float) -> float:
-		var n = 7.5625
-		var d = 2.75
+	func _run_next() -> void:
+		if _index >= _steps.size():
+			return
 
-		if t < 1.0 / d:
-			return n * t * t
-		elif t < 2.0 / d:
-			t -= 1.5 / d
-			return n * t * t + 0.75
-		elif t < 2.5 / d:
-			t -= 2.25 / d
-			return n * t * t + 0.9375
-		else:
-			t -= 2.625 / d
-			return n * t * t + 0.984375
+		var step = _steps[_index]
+		_index += 1
 
+		match step.type:
+			"wait":
+				var timer = _context.get_tree().create_timer(step.duration / 1000.0)
+				timer.timeout.connect(_run_next)
 
-# ----------------------------
-# COMPILER
-# ----------------------------
-class Compiler:
-	static func compile(params: Dictionary) -> CompiledTimeline:
-		var timeline = CompiledTimeline.new()
-
-		var targets_raw = params.get("targets", [])
-		var targets: Array = targets_raw if targets_raw is Array else [targets_raw]
-
-		var duration := float(params.get("duration", 1000.0)) / 1000.0
-		var delay := float(params.get("delay", 0.0)) / 1000.0
-
-		var easing = str(params.get("easing", "linear")).to_lower()
-		var easing_type = EASING_FUNCTIONS.get(easing, Ease.LINEAR)
-
-		for prop_key in params.keys():
-			if prop_key in ["targets", "duration", "easing", "delay"]:
-				continue
-
-			for target in targets:
-				if not is_instance_valid(target):
-					continue
-
-				var track = CompiledTrack.new()
-
-				track.duration = duration
-				track.delay = delay
-				track.easing_type = easing_type
-
-				var captured_target = target
-				var captured_key = prop_key
-
-				track.getter = func():
-					return captured_target.get(captured_key)
-
-				track.setter = func(v):
-					captured_target.set(captured_key, v)
-
-				var value = params[prop_key]
-
-				if value is String:
-					var s = value.strip_edges()
-					track.is_relative = true
-
-					if s.begins_with("+="):
-						track.relative_add = s.substr(2).to_float()
-					elif s.begins_with("-="):
-						track.relative_add = -s.substr(2).to_float()
-					elif s.begins_with("*="):
-						track.relative_multiplier = s.substr(2).to_float()
-				else:
-					track.from_value = float(captured_target.get(prop_key))
-					track.to_value = float(value)
-
-				timeline.bytecode.append(track)
-				timeline.total_duration = max(
-					timeline.total_duration,
-					track.delay + track.duration
-				)
-
-		return timeline
+			_:
+				_engine.run_step(step)
+				var timer2 = _context.get_tree().create_timer(step.duration / 1000.0)
+				timer2.timeout.connect(_run_next)
 
 
-# ----------------------------
-# RUNTIME DRIVER
-# ----------------------------
-class RuntimeTrackerNode extends Node:
-	var active_runs: Array[CompiledTimeline] = []
+	func _extract_props(config: Dictionary) -> Dictionary:
+		var props = {}
+		var reserved = ["duration", "ease", "delay", "stagger"]
 
-	func _process(delta: float) -> void:
-		for i in range(active_runs.size() - 1, -1, -1):
-			if active_runs[i].step_process(delta):
-				active_runs.remove_at(i)
+		for k in config.keys():
+			if k not in reserved:
+				props[k] = config[k]
 
-
-static var _runtime_node_ref: WeakRef = weakref(null)
-
-
-static func play(blueprint: Dictionary) -> CompiledTimeline:
-	var compiled = Compiler.compile(blueprint)
-	compiled.play()
-	return compiled
-
-
-static func _register_compiled_run(tl: CompiledTimeline) -> void:
-	var tracker = _get_runtime_driver()
-	if tracker and not tracker.active_runs.has(tl):
-		tracker.active_runs.append(tl)
-
-
-static func _get_runtime_driver() -> RuntimeTrackerNode:
-	var driver = _runtime_node_ref.get_ref()
-	if is_instance_valid(driver):
-		return driver
-
-	var tree = Engine.get_main_loop() as SceneTree
-	if not tree or not tree.root:
-		return null
-
-	var existing = tree.root.get_node_or_null("CompiledTweenRuntime")
-	if existing is RuntimeTrackerNode:
-		_runtime_node_ref = weakref(existing)
-		return existing
-
-	var new_driver = RuntimeTrackerNode.new()
-	new_driver.name = "CompiledTweenRuntime"
-	tree.root.call_deferred("add_child", new_driver)
-
-	_runtime_node_ref = weakref(new_driver)
-	return new_driver
+		return props
