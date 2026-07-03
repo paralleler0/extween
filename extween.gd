@@ -1,5 +1,12 @@
 class_name extween extends RefCounted
-# extween: an anime.js-inspired tweening wrapper for godot.
+# extween: an anime.js-inspired high-performance tweening wrapper for godot.
+
+# --- INNER HELPER CLASS FOR STAGGER CONFIGURATIONS ---
+class StaggerOptions extends RefCounted:
+	var grid: Vector2i = Vector2i.ONE
+	var from: Variant = "start" # "start", "center", "end", or an integer index
+	var axis: String = "all"    # "all", "x", "y"
+# ----------------------------------------------------
 
 var _tween: Tween
 var _targets: Array = []
@@ -67,6 +74,70 @@ static func play_tween(node: Node, targets: Variant, duration: float = 1.0, loop
 		et._targets = [targets]
 	return et
 
+# --- GLOBAL STAGGER GENERATOR ---
+static func stagger(val: Variant, opt: StaggerOptions = null) -> Callable:
+	if opt == null:
+		opt = StaggerOptions.new()
+		
+	return func(index: int, total: int, _target: Node) -> Variant:
+		var grid_cols = opt.grid.x
+		var grid_rows = opt.grid.y
+		
+		# Compute 2D coordinate inside grid bounds
+		var x = index % grid_cols
+		var y = index / grid_cols
+		
+		var cx = (grid_cols - 1) / 2.0
+		var cy = (grid_rows - 1) / 2.0
+		
+		var from_x = 0.0
+		var from_y = 0.0
+		
+		match opt.from:
+			"start":
+				from_x = 0.0
+				from_y = 0.0
+			"center":
+				from_x = cx
+				from_y = cy
+			"end":
+				from_x = grid_cols - 1
+				from_y = grid_rows - 1
+			_:
+				if str(opt.from).is_valid_int():
+					var from_idx = int(opt.from)
+					from_x = from_idx % grid_cols
+					from_y = from_idx / grid_cols
+		
+		var dist_x = abs(x - from_x)
+		var dist_y = abs(y - from_y)
+		
+		var distance = 0.0
+		match opt.axis:
+			"x": distance = dist_x
+			"y": distance = dist_y
+			_: distance = sqrt(dist_x * dist_x + dist_y * dist_y)
+			
+		var max_x = max(from_x, (grid_cols - 1) - from_x)
+		var max_y = max(from_y, (grid_rows - 1) - from_y)
+		var max_distance = 0.0
+		
+		match opt.axis:
+			"x": max_distance = max_x
+			"y": max_distance = max_y
+			_: max_distance = sqrt(max_x * max_x + max_y * max_y)
+			
+		var factor = distance / max_distance if max_distance > 0.0 else 0.0
+		
+		if val is Array and val.size() >= 2:
+			return lerp(float(val[0]), float(val[1]), factor)
+		elif val is Vector2:
+			return lerp(Vector2.ZERO, val, factor)
+		elif val is Vector3:
+			return lerp(Vector3.ZERO, val, factor)
+		else:
+			return float(val) * factor
+
 func duration(d: float) -> extween:
 	_duration = d
 	return self
@@ -109,11 +180,16 @@ func parallel() -> extween:
 	_parallel = true
 	return self
 
-func add(props: Dictionary, delay_stagger: float = 0.0) -> extween:
+func add(props: Dictionary, delay_stagger: Variant = 0.0) -> extween:
 	var is_first_tweener = true
 	for i in range(_targets.size()):
 		var target = _targets[i]
-		var current_delay = i * delay_stagger
+		
+		var current_delay = 0.0
+		if delay_stagger is Callable:
+			current_delay = float(delay_stagger.call(i, _targets.size(), target))
+		else:
+			current_delay = i * float(delay_stagger)
 		
 		for prop in props.keys():
 			var raw_value = props[prop]
@@ -161,8 +237,7 @@ func play() -> void:
 func kill() -> void:
 	_tween.kill()
 
-# --- NEW BAKING & ESTIMATION LOGIC ---
-
+# --- OPTIMIZED CACHING MECHANICS ---
 func _bake_custom_curve() -> void:
 	if not _custom_interpolator.is_valid():
 		return
@@ -170,7 +245,6 @@ func _bake_custom_curve() -> void:
 	for i in range(CURVE_SAMPLES + 1):
 		var t = float(i) / float(CURVE_SAMPLES)
 		_sampled_curve[i] = _custom_interpolator.call(t)
-	# Free memory from the temporary analytical math formula
 	_custom_interpolator = Callable()
 
 func _evaluate_baked_curve(t: float) -> float:
@@ -184,12 +258,14 @@ func _evaluate_baked_curve(t: float) -> float:
 	
 	return lerp(_sampled_curve[low_idx], _sampled_curve[high_idx], weight)
 
-# -------------------------------------
+func _bounce_sub_calculation(t: float) -> float:
+	if t < (1.0 / 2.75): return 7.5625 * t * t
+	elif t < (2.0 / 2.75): t -= (1.5 / 2.75); return 7.5625 * t * t + 0.75
+	elif t < (2.5 / 2.75): t -= (2.25 / 2.75); return 7.5625 * t * t + 0.9375
+	else: t -= (2.625 / 2.75); return 7.5625 * t * t + 0.984375
 
 func _build_parameterized_ease(name: String, args: Array) -> void:
 	match name:
-		# --- ANIME.JS POWER EASINGS ---
-		# Syntaxes: "in(3)", "out(4)", "inout(2.5)", "outin(3)"
 		"in":
 			var p = args[0] if args.size() > 0 else 1.675
 			_custom_interpolator = func(t: float) -> float: return pow(t, p)
@@ -205,39 +281,26 @@ func _build_parameterized_ease(name: String, args: Array) -> void:
 			_custom_interpolator = func(t: float) -> float:
 				if t < 0.5: return 0.5 * (1.0 - pow(1.0 - t * 2.0, p))
 				return 0.5 + 0.5 * pow((t - 0.5) * 2.0, p)
-
-		# --- ANIME.JS SPRING PHYSICS ---
-		# Syntaxes: "spring(mass, stiffness, damping, velocity)" 
-		# Example: "spring(1, 100, 10, 0)"
 		"spring":
-			var m = args[0] if args.size() > 0 else 1.0     # mass
-			var k = args[1] if args.size() > 1 else 100.0   # stiffness
-			var c = args[2] if args.size() > 2 else 10.0    # damping
-			var v0 = args[3] if args.size() > 3 else 0.0   # initial velocity
-			
-			var w0 = sqrt(k / m) # undamped natural frequency
-			var zeta = c / (2.0 * sqrt(k * m)) # damping ratio
-			
-			if zeta < 1.0: # Underdamped spring
+			var m = args[0] if args.size() > 0 else 1.0
+			var k = args[1] if args.size() > 1 else 100.0
+			var c = args[2] if args.size() > 2 else 10.0
+			var v0 = args[3] if args.size() > 3 else 0.0
+			var w0 = sqrt(k / m)
+			var zeta = c / (2.0 * sqrt(k * m))
+			if zeta < 1.0:
 				var wd = w0 * sqrt(1.0 - zeta * zeta)
 				_custom_interpolator = func(t: float) -> float:
 					if t <= 0.0: return 0.0
 					if t >= 1.0: return 1.0
 					var envelope = exp(-zeta * w0 * t)
-					var cos_term = cos(wd * t)
-					var sin_term = sin(wd * t)
 					var c2 = (v0 + zeta * w0) / wd
-					return 1.0 - envelope * (cos_term + c2 * sin_term)
-			else: # Critically damped or Overdamped spring
+					return 1.0 - envelope * (cos(wd * t) + c2 * sin(wd * t))
+			else:
 				_custom_interpolator = func(t: float) -> float:
 					if t <= 0.0: return 0.0
 					if t >= 1.0: return 1.0
-					var r1 = -w0
-					var c1 = 1.0
-					var c2 = v0 + w0
-					return 1.0 - (c1 + c2 * t) * exp(r1 * t)
-
-		# --- MISSING OUT-IN VARIANTS ---
+					return 1.0 - (1.0 + (v0 + w0) * t) * exp(-w0 * t)
 		"outinquad":
 			_custom_interpolator = func(t: float) -> float:
 				if t < 0.5: return -2.0 * t * (t - 1.0)
@@ -264,7 +327,7 @@ func _build_parameterized_ease(name: String, args: Array) -> void:
 				if t < 0.5: return 0.5 * sqrt(1.0 - pow(t * 2.0 - 1.0, 2.0))
 				return 0.5 + 0.5 * (1.0 - sqrt(1.0 - pow((t - 0.5) * 2.0, 2.0)))
 		"outinback":
-			var s = (args[0] if args.size() > 0 else 1.70158)
+			var s = args[0] if args.size() > 0 else 1.70158
 			_custom_interpolator = func(t: float) -> float:
 				if t < 0.5: t = t * 2.0 - 1.0; return 0.5 * (t * t * ((s + 1.0) * t + s) + 1.0)
 				t = (t - 0.5) * 2.0; return 0.5 + 0.5 * (t * t * ((s + 1.0) * t - s))
@@ -282,8 +345,6 @@ func _build_parameterized_ease(name: String, args: Array) -> void:
 			_custom_interpolator = func(t: float) -> float:
 				if t < 0.5: return 0.5 * (1.0 - _bounce_sub_calculation(1.0 - t * 2.0))
 				return 0.5 + 0.5 * _bounce_sub_calculation((t - 0.5) * 2.0)
-
-		# --- PRE-EXISTING ALGORITHMS ---
 		"cubicbezier":
 			var x1 = args[0] if args.size() > 0 else 0.0
 			var y1 = args[1] if args.size() > 1 else 0.0
@@ -347,15 +408,5 @@ func _build_parameterized_ease(name: String, args: Array) -> void:
 			_transition_type = Tween.TRANS_LINEAR
 			_ease_type = Tween.EASE_IN_OUT
 			return
-
-	_bake_custom_curve()
-
-# Helper math function specifically for baking outinbounce / outbounce graphs cleanly
-func _bounce_sub_calculation(t: float) -> float:
-	if t < (1.0 / 2.75): return 7.5625 * t * t
-	elif t < (2.0 / 2.75): t -= (1.5 / 2.75); return 7.5625 * t * t + 0.75
-	elif t < (2.5 / 2.75): t -= (2.25 / 2.75); return 7.5625 * t * t + 0.9375
-	else: t -= (2.625 / 2.75); return 7.5625 * t * t + 0.984375
-
 
 	_bake_custom_curve()
