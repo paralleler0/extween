@@ -60,7 +60,7 @@ func run_step(step: Dictionary) -> void:
 			var end_val = props[prop]
 			
 			if step_type == "from":
-				# 'from' animations require setting the target value immediately 
+				# 'from' animations set the target value immediately 
 				# before the tween loop interpolates back to its original value
 				var start_val = target.get(prop)
 				target.set(prop, end_val)
@@ -87,13 +87,34 @@ static func _is_simple(value) -> bool:
 		TYPE_COLOR
 	]
 
+# ==============================================================================
+# ANIME.JS INTEGRATED EASING ENGINE
+# ==============================================================================
+
 static func _is_native_easing(ease_name: String) -> bool:
 	var e = ease_name.strip_edges().to_lower()
-	return e in ["linear", "sine", "quad", "cubic", "quart", "quint", "expo", "circ", "back", "bounce", "elastic"]
+	# Strip typical anime.js prefixes to check for native capability
+	var base = e.replace("easeinout", "").replace("easein", "").replace("easeout", "")
+	if base == "": base = "linear"
+	return base in ["linear", "sine", "quad", "cubic", "quart", "quint", "expo", "circ", "back", "bounce", "elastic"]
 
 static func _apply_ease(tw: PropertyTween, ease_name: String) -> void:
-	match ease_name.to_lower():
-		"linear": tw.set_trans(Tween.TRANS_LINEAR)
+	var e = ease_name.strip_edges().to_lower()
+	
+	# Determine Direction
+	if e.begins_with("easeinout"):
+		tw.set_ease(Tween.EASE_IN_OUT)
+	elif e.begins_with("easeout"):
+		tw.set_ease(Tween.EASE_OUT)
+	elif e.begins_with("easein"):
+		tw.set_ease(Tween.EASE_IN)
+	else:
+		tw.set_ease(Tween.EASE_IN_OUT) # Fallback / Default
+		
+	# Determine Equation type
+	var base = e.replace("easeinout", "").replace("easein", "").replace("easeout", "")
+	match base:
+		"", "linear": tw.set_trans(Tween.TRANS_LINEAR)
 		"sine": tw.set_trans(Tween.TRANS_SINE)
 		"quad": tw.set_trans(Tween.TRANS_QUAD)
 		"cubic": tw.set_trans(Tween.TRANS_CUBIC)
@@ -104,26 +125,78 @@ static func _apply_ease(tw: PropertyTween, ease_name: String) -> void:
 		"back": tw.set_trans(Tween.TRANS_BACK)
 		"bounce": tw.set_trans(Tween.TRANS_BOUNCE)
 		"elastic": tw.set_trans(Tween.TRANS_ELASTIC)
+		_: tw.set_trans(Tween.TRANS_LINEAR)
 
 static func evaluate_easing(easing_name: String, t: float) -> float:
 	t = clamp(t, 0.0, 1.0)
 	var e = easing_name.strip_edges().to_lower()
 
-	if e.begins_with("in("):
-		var p = e.split("(")[1].replace(")", "").to_float()
+	# 1. Custom Functional Power Easings: out(3), in(2.5)
+	if e.begins_with("in(") and e.ends_with(")"):
+		var p = e.get_slice("(", 1).replace(")", "").to_float()
 		return pow(t, p)
-
-	if e.begins_with("out("):
-		var p = e.split("(")[1].replace(")", "").to_float()
+	if e.begins_with("out(") and e.ends_with(")"):
+		var p = e.get_slice("(", 1).replace(")", "").to_float()
 		return 1.0 - pow(1.0 - t, p)
 
+	# 2. Anime.js Parametric Bezier Engine: cubicBezier(.42, 0, .58, 1)
+	if e.begins_with("cubicbezier(") or e.begins_with("bezier("):
+		var raw = e.get_slice("(", 1).replace(")", "")
+		var params = raw.split(",")
+		if params.size() == 4:
+			return _solve_bezier(t, params[0].to_float(), params[1].to_float(), params[2].to_float(), params[3].to_float())
+
+	# 3. Anime.js Damped Spring Engine: spring(mass, stiffness, damping, velocity)
+	if e.begins_with("spring("):
+		var raw = e.get_slice("(", 1).replace(")", "")
+		var params = raw.split(",")
+		# Default fallback settings matching anime.js physics presets
+		var mass := 1.0 if params.size() < 1 else params[0].to_float()
+		var stiff := 100.0 if params.size() < 2 else params[1].to_float()
+		var damp := 10.0 if params.size() < 3 else params[2].to_float()
+		var velocity := 0.0 if params.size() < 4 else params[3].to_float()
+		return _solve_spring(t, mass, stiff, damp, velocity)
+
+	# Fallback evaluations for explicitly typed non-native variations
 	match e:
-		"linear": return t
 		"insine": return 1.0 - cos(t * PI * 0.5)
 		"outsine": return sin(t * PI * 0.5)
-		"inoutcirc": return 0.5 * (1.0 - cos(PI * t))
-		"outcirc": return sqrt(1.0 - (t - 1.0) * (t - 1.0))
+		"inoutcirc": return 0.5 * (1.0 - cos(PI * t)) if t < 0.5 else 0.5 * (1.0 + sqrt(1.0 - pow(2.0 * t - 2.0, 2.0)))
+		"outcirc": return sqrt(1.0 - pow(t - 1.0, 2.0))
 		_: return t
+
+# Analytical approximation solver for Cubic Bezier curves
+static func _solve_bezier(t: float, x1: float, y1: float, x2: float, y2: float) -> float:
+	if x1 == y1 and x2 == y2: return t # Linear optimization
+	# Use binary search to resolve the X coordinate value cleanly over time
+	var low := 0.0
+	var high := 1.0
+	var guess_x := 0.0
+	
+	for i in range(8): # 8 iterations give high performance sub-pixel precision
+		guess_x = (low + high) / 2.0
+		var x = 3.0 * pow(1.0 - guess_x, 2.0) * guess_x * x1 + 3.0 * (1.0 - guess_x) * pow(guess_x, 2.0) * x2 + pow(guess_x, 3.0)
+		if x > t: high = guess_x
+		else: low = guess_x
+		
+	# Evaluate and return the matching solved Y coordinate
+	return 3.0 * pow(1.0 - guess_x, 2.0) * guess_x * y1 + 3.0 * (1.0 - guess_x) * pow(guess_x, 2.0) * y2 + pow(guess_x, 3.0)
+
+# Simplified Harmonic Spring physics integration over standardized timeframe
+static func _solve_spring(t: float, mass: float, stiffness: float, damping: float, velocity: float) -> float:
+	var w0 = sqrt(stiffness / mass)
+	var zeta = damping / (2.0 * sqrt(stiffness * mass))
+	var envelope = exp(-zeta * w0 * t)
+	
+	if zeta < 1.0: # Underdamped spring curve
+		var wd = w0 * sqrt(1.0 - zeta * zeta)
+		return 1.0 - envelope * (cos(wd * t) + ((zeta * w0 - velocity) / wd) * sin(wd * t))
+	else: # Overdamped or critically damped spring curve
+		return 1.0 - envelope * (1.0 + (w0 - velocity) * t)
+
+# ==============================================================================
+# INTERNAL HELPER CLASSES & API TIMELINE
+# ==============================================================================
 
 # Inner class resolving frame-delayed start values for custom expressions
 class _InterpolationBinder:
